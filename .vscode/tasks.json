@@ -1,0 +1,63 @@
+{
+  "version": "2.0.0",
+  "inputs": [
+    {
+      "id": "serialPort",
+      "type": "promptString",
+      "description": "ESP32 serial port, for example COM5",
+      "default": "COM5"
+    }
+  ],
+  "tasks": [
+    {
+      "label": "Arduino: compile ESP32",
+      "type": "shell",
+      "command": "D:\\arduino-cli_1.5.1_Windows_64bit\\arduino-cli.exe",
+      "args": [
+        "compile",
+        "--fqbn",
+        "esp32:esp32:esp32",
+        "${workspaceFolder}",
+        "--warnings",
+        "default"
+      ],
+      "group": {
+        "kind": "build",
+        "isDefault": true
+      },
+      "problemMatcher": []
+    },
+    {
+      "label": "Arduino: upload ESP32",
+      "type": "shell",
+      "command": "D:\\arduino-cli_1.5.1_Windows_64bit\\arduino-cli.exe",
+      "args": [
+        "compile",
+        "--upload",
+        "-p",
+        "${input:serialPort}",
+        "--fqbn",
+        "esp32:esp32:esp32",
+        "${workspaceFolder}",
+        "--warnings",
+        "default"
+      ],
+      "group": "build",
+      "problemMatcher": []
+    },
+    {
+      "label": "Arduino: monitor ESP32",
+      "type": "shell",
+      "command": "D:\\arduino-cli_1.5.1_Windows_64bit\\arduino-cli.exe",
+      "args": [
+        "monitor",
+        "-p",
+        "${input:serialPort}",
+        "-c",
+        "baudrate=115200"
+      ],
+      "problemMatcher": []
+    }
+  ]
+}
+
