@@ -311,10 +311,10 @@ h3{margin:0;font-size:14px;line-height:1.3;color:var(--ink);letter-spacing:0}
         </select>
       </label>
       <label>RX GPIO
-        <input id="rxPin" type="number" min="0" max="39" value="16">
+        <input id="rxPin" type="number" min="0" max="39" value="25">
       </label>
       <label>TX GPIO
-        <input id="txPin" type="number" min="0" max="33" value="17">
+        <input id="txPin" type="number" min="0" max="33" value="26">
       </label>
       <button class="primary" id="applyBtn">应用</button>
       <datalist id="baudList">
@@ -443,8 +443,8 @@ h3{margin:0;font-size:14px;line-height:1.3;color:var(--ink);letter-spacing:0}
       "data=" + $("dataBits").value,
       "parity=" + $("parity").value,
       "stop=" + $("stopBits").value,
-      "rx=" + Number($("rxPin").value || 16),
-      "tx=" + Number($("txPin").value || 17),
+      "rx=" + Number($("rxPin").value || 25),
+      "tx=" + Number($("txPin").value || 26),
       "ip=" + (mockMode ? "local-preview" : location.hostname),
       "wifi=" + (mockMode ? "Mock" : "--"),
       "ssid=" + (mockMode ? "Local Preview" : "--"),
@@ -968,8 +968,8 @@ h3{margin:0;font-size:14px;line-height:1.3;color:var(--ink);letter-spacing:0}
       "data=" + $("dataBits").value,
       "parity=" + $("parity").value,
       "stop=" + $("stopBits").value,
-      "rx=" + Number($("rxPin").value || 16),
-      "tx=" + Number($("txPin").value || 17)
+      "rx=" + Number($("rxPin").value || 25),
+      "tx=" + Number($("txPin").value || 26)
     ].join(" ");
     sendCommand(cmd);
   });

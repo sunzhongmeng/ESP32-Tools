@@ -4,6 +4,8 @@
 #include <WiFi.h>
 #include <WebServer.h>
 #include <ESPmDNS.h>
+#include <driver/rmt.h>
+#include <esp_err.h>
 #include <mbedtls/base64.h>
 #include <mbedtls/sha1.h>
 #include <ctype.h>
@@ -30,18 +32,17 @@ static const uint8_t MAX_WS_CLIENTS = 4;
 static const size_t WS_MAX_PAYLOAD = 2048;
 static const size_t UART_RX_BATCH = 512;
 
-static const int WIFI_MODE_SELECT_PIN = 34;  // High at boot: join LAN. Low: AP mode.
-static const int UART_TX_LED_PIN = 35;       // GPIO35 is input-only on ESP32-WROOM-32.
-static const int UART_RX_LED_PIN = 32;
-static const int SYSTEM_LED_PIN = 33;
+static const int WS2812_STATUS_PIN = 16;
+static const rmt_channel_t WS2812_RMT_CHANNEL = RMT_CHANNEL_0;
+static const uint8_t STATUS_RED_LEVEL = 48;
+static const uint8_t STATUS_GREEN_LEVEL = 32;
+static const uint32_t STATUS_LED_BLINK_MS = 1000;
 
-static const int DEFAULT_UART_RX_PIN = 16;
-static const int DEFAULT_UART_TX_PIN = 17;
+static const int DEFAULT_UART_RX_PIN = 25;
+static const int DEFAULT_UART_TX_PIN = 26;
 static const uint32_t DEFAULT_BAUD = 115200;
 static const char *AP_SSID = "ESP32-Tools";
 static const char *AP_PASSWORD = "12345678";
-static const uint32_t UART_LED_PULSE_MS = 60;
-static const uint32_t SYSTEM_LED_BLINK_MS = 500;
 
 IPAddress STA_STATIC_IP(192, 168, 0, 201);
 IPAddress STA_GATEWAY(192, 168, 0, 1);
@@ -95,19 +96,16 @@ bool apMode = false;
 bool staModeRequested = false;
 bool wifiFault = false;
 bool uartFault = false;
-bool txLedAvailable = false;
-bool rxLedAvailable = false;
-bool systemLedAvailable = false;
-bool systemLedState = false;
+bool statusLedReady = false;
+bool statusLedGreenOn = false;
 String activeSsid;
 String lastFaultText;
 uint64_t uartRxBytes = 0;
 uint64_t uartTxBytes = 0;
-uint32_t txLedOffAt = 0;
-uint32_t rxLedOffAt = 0;
 uint32_t lastStatsMs = 0;
 uint32_t lastReconnectMs = 0;
-uint32_t lastSystemBlinkMs = 0;
+uint32_t lastStatusBlinkMs = 0;
+uint32_t statusLedColor = 0xFFFFFFFF;
 
 static const char INDEX_HTML[] PROGMEM = R"HTML(
 <!doctype html>
@@ -422,10 +420,10 @@ h3{margin:0;font-size:14px;line-height:1.3;color:var(--ink);letter-spacing:0}
         </select>
       </label>
       <label>RX GPIO
-        <input id="rxPin" type="number" min="0" max="39" value="16">
+        <input id="rxPin" type="number" min="0" max="39" value="25">
       </label>
       <label>TX GPIO
-        <input id="txPin" type="number" min="0" max="33" value="17">
+        <input id="txPin" type="number" min="0" max="33" value="26">
       </label>
       <button class="primary" id="applyBtn">应用</button>
       <datalist id="baudList">
@@ -554,8 +552,8 @@ h3{margin:0;font-size:14px;line-height:1.3;color:var(--ink);letter-spacing:0}
       "data=" + $("dataBits").value,
       "parity=" + $("parity").value,
       "stop=" + $("stopBits").value,
-      "rx=" + Number($("rxPin").value || 16),
-      "tx=" + Number($("txPin").value || 17),
+      "rx=" + Number($("rxPin").value || 25),
+      "tx=" + Number($("txPin").value || 26),
       "ip=" + (mockMode ? "local-preview" : location.hostname),
       "wifi=" + (mockMode ? "Mock" : "--"),
       "ssid=" + (mockMode ? "Local Preview" : "--"),
@@ -1079,8 +1077,8 @@ h3{margin:0;font-size:14px;line-height:1.3;color:var(--ink);letter-spacing:0}
       "data=" + $("dataBits").value,
       "parity=" + $("parity").value,
       "stop=" + $("stopBits").value,
-      "rx=" + Number($("rxPin").value || 16),
-      "tx=" + Number($("txPin").value || 17)
+      "rx=" + Number($("rxPin").value || 25),
+      "tx=" + Number($("txPin").value || 26)
     ].join(" ");
     sendCommand(cmd);
   });
@@ -1265,16 +1263,20 @@ bool isFlashPin(int pin) {
   return pin >= 6 && pin <= 11;
 }
 
+bool reservedBoardPin(int pin) {
+  return pin == WS2812_STATUS_PIN || pin == 34 || pin == 35;
+}
+
 bool validRxPin(int pin) {
-  return pin >= 0 && pin <= 39 && !isFlashPin(pin);
+  return pin >= 0 && pin <= 39 && !isFlashPin(pin) && !reservedBoardPin(pin);
 }
 
 bool validTxPin(int pin) {
-  return pin >= 0 && pin <= 33 && !isFlashPin(pin);
+  return pin >= 0 && pin <= 33 && !isFlashPin(pin) && !reservedBoardPin(pin);
 }
 
 bool outputCapablePin(int pin) {
-  return pin >= 0 && pin <= 33 && !isFlashPin(pin);
+  return pin >= 0 && pin <= 33 && !isFlashPin(pin) && !reservedBoardPin(pin);
 }
 
 void setWifiFault(const String &message) {
@@ -1297,70 +1299,73 @@ void clearUartFault() {
   if (!systemFaultActive()) lastFaultText = "";
 }
 
-void setupIndicatorPins() {
-  systemLedAvailable = outputCapablePin(SYSTEM_LED_PIN);
-  txLedAvailable = outputCapablePin(UART_TX_LED_PIN);
-  rxLedAvailable = outputCapablePin(UART_RX_LED_PIN);
+void writeWs2812Rgb(uint8_t red, uint8_t green, uint8_t blue) {
+  if (!statusLedReady) return;
 
-  if (systemLedAvailable) {
-    pinMode(SYSTEM_LED_PIN, OUTPUT);
-    digitalWrite(SYSTEM_LED_PIN, LOW);
-  } else {
-    Serial.println("Warning: system LED pin is not output-capable.");
+  uint32_t nextColor = ((uint32_t)red << 16) | ((uint32_t)green << 8) | blue;
+  if (nextColor == statusLedColor) return;
+  statusLedColor = nextColor;
+
+  static const uint16_t t0h = 14;  // 0.35 us at 40 MHz RMT clock.
+  static const uint16_t t0l = 32;  // 0.80 us.
+  static const uint16_t t1h = 28;  // 0.70 us.
+  static const uint16_t t1l = 24;  // 0.60 us.
+
+  uint8_t grb[3] = {green, red, blue};
+  rmt_item32_t items[24];
+  uint8_t item = 0;
+  for (uint8_t colorIndex = 0; colorIndex < 3; colorIndex++) {
+    for (int8_t bit = 7; bit >= 0; bit--) {
+      bool one = (grb[colorIndex] & (1 << bit)) != 0;
+      items[item].level0 = 1;
+      items[item].duration0 = one ? t1h : t0h;
+      items[item].level1 = 0;
+      items[item].duration1 = one ? t1l : t0l;
+      item++;
+    }
   }
 
-  if (txLedAvailable) {
-    pinMode(UART_TX_LED_PIN, OUTPUT);
-    digitalWrite(UART_TX_LED_PIN, LOW);
-  } else {
-    Serial.println("Warning: GPIO35 is input-only on ESP32-WROOM-32, TX LED output is disabled.");
+  rmt_write_items(WS2812_RMT_CHANNEL, items, 24, true);
+  rmt_wait_tx_done(WS2812_RMT_CHANNEL, pdMS_TO_TICKS(10));
+}
+
+void setupStatusLed() {
+  rmt_config_t config = {};
+  config.rmt_mode = RMT_MODE_TX;
+  config.channel = WS2812_RMT_CHANNEL;
+  config.gpio_num = (gpio_num_t)WS2812_STATUS_PIN;
+  config.mem_block_num = 1;
+  config.clk_div = 2;
+  config.tx_config.loop_en = false;
+  config.tx_config.carrier_en = false;
+  config.tx_config.idle_output_en = true;
+  config.tx_config.idle_level = RMT_IDLE_LEVEL_LOW;
+  config.tx_config.carrier_level = RMT_CARRIER_LEVEL_HIGH;
+  config.tx_config.carrier_duty_percent = 33;
+
+  esp_err_t result = rmt_config(&config);
+  if (result == ESP_OK) result = rmt_driver_install(WS2812_RMT_CHANNEL, 0, 0);
+  statusLedReady = result == ESP_OK;
+  if (!statusLedReady) {
+    Serial.print("WS2812B status LED init failed: ");
+    Serial.println((int)result);
+    return;
   }
-
-  if (rxLedAvailable) {
-    pinMode(UART_RX_LED_PIN, OUTPUT);
-    digitalWrite(UART_RX_LED_PIN, LOW);
-  } else {
-    Serial.println("Warning: RX LED pin is not output-capable.");
-  }
-}
-
-void pulseLed(int pin, bool available, uint32_t &offAt) {
-  if (!available) return;
-  digitalWrite(pin, HIGH);
-  offAt = millis() + UART_LED_PULSE_MS;
-}
-
-void pulseTxLed() {
-  pulseLed(UART_TX_LED_PIN, txLedAvailable, txLedOffAt);
-}
-
-void pulseRxLed() {
-  pulseLed(UART_RX_LED_PIN, rxLedAvailable, rxLedOffAt);
-}
-
-void servicePulseLed(int pin, bool available, uint32_t &offAt) {
-  if (!available || offAt == 0) return;
-  if ((int32_t)(millis() - offAt) >= 0) {
-    digitalWrite(pin, LOW);
-    offAt = 0;
-  }
+  writeWs2812Rgb(0, 0, 0);
 }
 
 void serviceIndicators() {
-  servicePulseLed(UART_TX_LED_PIN, txLedAvailable, txLedOffAt);
-  servicePulseLed(UART_RX_LED_PIN, rxLedAvailable, rxLedOffAt);
-
-  if (!systemLedAvailable) return;
-  if (systemFaultActive()) {
-    digitalWrite(SYSTEM_LED_PIN, HIGH);
-    systemLedState = true;
+  if (!statusLedReady) return;
+  if (wifiFault) {
+    statusLedGreenOn = false;
+    writeWs2812Rgb(STATUS_RED_LEVEL, 0, 0);
     return;
   }
 
-  if (millis() - lastSystemBlinkMs >= SYSTEM_LED_BLINK_MS) {
-    lastSystemBlinkMs = millis();
-    systemLedState = !systemLedState;
-    digitalWrite(SYSTEM_LED_PIN, systemLedState ? HIGH : LOW);
+  if (millis() - lastStatusBlinkMs >= STATUS_LED_BLINK_MS) {
+    lastStatusBlinkMs = millis();
+    statusLedGreenOn = !statusLedGreenOn;
+    writeWs2812Rgb(0, statusLedGreenOn ? STATUS_GREEN_LEVEL : 0, 0);
   }
 }
 
@@ -1434,7 +1439,6 @@ bool sendUartBreakMs(uint32_t durationMs, String &error) {
       serialConfigValue(uartSettings.dataBits, uartSettings.parity, uartSettings.stopBits),
       uartSettings.rxPin,
       uartSettings.txPin);
-  pulseTxLed();
   return true;
 }
 
@@ -1701,7 +1705,6 @@ void handleWsFrame(uint8_t clientIndex) {
       if (client.payloadPos > 0) {
         size_t written = BridgeSerial.write(client.payload, client.payloadPos);
         uartTxBytes += written;
-        if (written > 0) pulseTxLed();
       }
       break;
     case 0x8:
@@ -1837,7 +1840,6 @@ void handleSerialToWeb() {
   if (len > 0 && (len == sizeof(buffer) || millis() - lastByteMs >= 5)) {
     uartRxBytes += len;
     broadcastBinary(buffer, len);
-    pulseRxLed();
     len = 0;
   }
 }
@@ -1865,14 +1867,10 @@ void setupWifi() {
   WiFi.persistent(false);
   WiFi.setSleep(false);
 
-  pinMode(WIFI_MODE_SELECT_PIN, INPUT);
-  delay(10);
-  staModeRequested = digitalRead(WIFI_MODE_SELECT_PIN) == HIGH;
+  staModeRequested = hasConfiguredWifi();
 
-  Serial.print("WiFi mode select GPIO");
-  Serial.print(WIFI_MODE_SELECT_PIN);
-  Serial.print(": ");
-  Serial.println(staModeRequested ? "HIGH, use STA" : "LOW, use AP");
+  Serial.print("WiFi mode: ");
+  Serial.println(staModeRequested ? "STA preferred" : "AP only, no STA credentials");
 
   if (staModeRequested && hasConfiguredWifi()) {
     Serial.print("Connecting to WiFi: ");
@@ -1957,7 +1955,7 @@ void setup() {
   delay(300);
   Serial.println();
   Serial.println("ESP32 Wireless Web UART");
-  setupIndicatorPins();
+  setupStatusLed();
 
   String error;
   if (!applyUartSettings(uartSettings, error)) {
