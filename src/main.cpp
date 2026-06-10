@@ -9,10 +9,20 @@
 #include <ctype.h>
 #include <string.h>
 
-// Change these two values before uploading. If connection fails, the firmware
-// starts a fallback AP named ESP32-UART-xxxx with password 12345678.
-const char *WIFI_SSID = "YOUR_WIFI_SSID";
-const char *WIFI_PASSWORD = "YOUR_WIFI_PASSWORD";
+#if __has_include("wifi_config.h")
+#include "wifi_config.h"
+#endif
+
+#ifndef ESP32_TOOLS_STA_SSID
+#define ESP32_TOOLS_STA_SSID "YOUR_WIFI_SSID"
+#endif
+
+#ifndef ESP32_TOOLS_STA_PASSWORD
+#define ESP32_TOOLS_STA_PASSWORD "YOUR_WIFI_PASSWORD"
+#endif
+
+static const char *STA_WIFI_SSID = ESP32_TOOLS_STA_SSID;
+static const char *STA_WIFI_PASSWORD = ESP32_TOOLS_STA_PASSWORD;
 
 static const uint16_t HTTP_PORT = 80;
 static const uint16_t WS_PORT = 81;
@@ -20,14 +30,24 @@ static const uint8_t MAX_WS_CLIENTS = 4;
 static const size_t WS_MAX_PAYLOAD = 2048;
 static const size_t UART_RX_BATCH = 512;
 
+static const int WIFI_MODE_SELECT_PIN = 34;  // High at boot: join LAN. Low: AP mode.
+static const int UART_TX_LED_PIN = 35;       // GPIO35 is input-only on ESP32-WROOM-32.
+static const int UART_RX_LED_PIN = 32;
+static const int SYSTEM_LED_PIN = 33;
+
 static const int DEFAULT_UART_RX_PIN = 16;
 static const int DEFAULT_UART_TX_PIN = 17;
 static const uint32_t DEFAULT_BAUD = 115200;
+static const char *AP_SSID = "ESP32-Tools";
 static const char *AP_PASSWORD = "12345678";
+static const uint32_t UART_LED_PULSE_MS = 60;
+static const uint32_t SYSTEM_LED_BLINK_MS = 500;
 
-#ifndef LED_BUILTIN
-#define LED_BUILTIN 2
-#endif
+IPAddress STA_STATIC_IP(192, 168, 0, 201);
+IPAddress STA_GATEWAY(192, 168, 0, 1);
+IPAddress STA_SUBNET(255, 255, 255, 0);
+IPAddress STA_DNS1(192, 168, 0, 1);
+IPAddress STA_DNS2(8, 8, 8, 8);
 
 WebServer httpServer(HTTP_PORT);
 WiFiServer wsServer(WS_PORT);
@@ -72,11 +92,22 @@ UartSettings uartSettings;
 WsClient wsClients[MAX_WS_CLIENTS];
 
 bool apMode = false;
+bool staModeRequested = false;
+bool wifiFault = false;
+bool uartFault = false;
+bool txLedAvailable = false;
+bool rxLedAvailable = false;
+bool systemLedAvailable = false;
+bool systemLedState = false;
 String activeSsid;
+String lastFaultText;
 uint64_t uartRxBytes = 0;
 uint64_t uartTxBytes = 0;
+uint32_t txLedOffAt = 0;
+uint32_t rxLedOffAt = 0;
 uint32_t lastStatsMs = 0;
 uint32_t lastReconnectMs = 0;
+uint32_t lastSystemBlinkMs = 0;
 
 static const char INDEX_HTML[] PROGMEM = R"HTML(
 <!doctype html>
@@ -359,6 +390,8 @@ h3{margin:0;font-size:14px;line-height:1.3;color:var(--ink);letter-spacing:0}
       <span class="chip"><span class="dot" id="connDot"></span><span id="connText">未连接</span></span>
       <span class="chip">IP <b id="ipText">--</b></span>
       <span class="chip">Wi-Fi <b id="wifiText">--</b></span>
+      <span class="chip">MODE <b id="modeText">--</b></span>
+      <span class="chip">FAULT <b id="faultText">none</b></span>
     </div>
   </header>
 
@@ -526,6 +559,8 @@ h3{margin:0;font-size:14px;line-height:1.3;color:var(--ink);letter-spacing:0}
       "ip=" + (mockMode ? "local-preview" : location.hostname),
       "wifi=" + (mockMode ? "Mock" : "--"),
       "ssid=" + (mockMode ? "Local Preview" : "--"),
+      "select=" + (mockMode ? "PREVIEW" : "--"),
+      "fault=none",
       "clients=1"
     ].join("|");
   }
@@ -594,6 +629,8 @@ h3{margin:0;font-size:14px;line-height:1.3;color:var(--ink);letter-spacing:0}
       $("txPin").value = data.tx || $("txPin").value;
       $("ipText").textContent = data.ip || location.hostname;
       $("wifiText").textContent = data.wifi || "--";
+      $("modeText").textContent = data.select || "--";
+      $("faultText").textContent = data.fault || "none";
       $("clients").textContent = data.clients || "1";
       $("serialText").textContent = `${$("baud").value} ${$("dataBits").value}${$("parity").value}${$("stopBits").value}`;
       setConn("ok", "已连接");
@@ -1148,6 +1185,10 @@ String ipString() {
   return apMode ? WiFi.softAPIP().toString() : WiFi.localIP().toString();
 }
 
+bool systemFaultActive() {
+  return wifiFault || uartFault;
+}
+
 uint8_t activeClientCount() {
   uint8_t count = 0;
   for (uint8_t i = 0; i < MAX_WS_CLIENTS; i++) {
@@ -1177,6 +1218,10 @@ String makeStatusMessage() {
   msg += apMode ? "AP" : "STA";
   msg += "|ssid=";
   msg += sanitized(activeSsid);
+  msg += "|select=";
+  msg += staModeRequested ? "STA" : "AP";
+  msg += "|fault=";
+  msg += systemFaultActive() ? sanitized(lastFaultText.length() ? lastFaultText : "fault") : "none";
   msg += "|clients=";
   msg += activeClientCount();
   return msg;
@@ -1226,6 +1271,97 @@ bool validRxPin(int pin) {
 
 bool validTxPin(int pin) {
   return pin >= 0 && pin <= 33 && !isFlashPin(pin);
+}
+
+bool outputCapablePin(int pin) {
+  return pin >= 0 && pin <= 33 && !isFlashPin(pin);
+}
+
+void setWifiFault(const String &message) {
+  wifiFault = true;
+  lastFaultText = message;
+}
+
+void clearWifiFault() {
+  wifiFault = false;
+  if (!systemFaultActive()) lastFaultText = "";
+}
+
+void setUartFault(const String &message) {
+  uartFault = true;
+  lastFaultText = message;
+}
+
+void clearUartFault() {
+  uartFault = false;
+  if (!systemFaultActive()) lastFaultText = "";
+}
+
+void setupIndicatorPins() {
+  systemLedAvailable = outputCapablePin(SYSTEM_LED_PIN);
+  txLedAvailable = outputCapablePin(UART_TX_LED_PIN);
+  rxLedAvailable = outputCapablePin(UART_RX_LED_PIN);
+
+  if (systemLedAvailable) {
+    pinMode(SYSTEM_LED_PIN, OUTPUT);
+    digitalWrite(SYSTEM_LED_PIN, LOW);
+  } else {
+    Serial.println("Warning: system LED pin is not output-capable.");
+  }
+
+  if (txLedAvailable) {
+    pinMode(UART_TX_LED_PIN, OUTPUT);
+    digitalWrite(UART_TX_LED_PIN, LOW);
+  } else {
+    Serial.println("Warning: GPIO35 is input-only on ESP32-WROOM-32, TX LED output is disabled.");
+  }
+
+  if (rxLedAvailable) {
+    pinMode(UART_RX_LED_PIN, OUTPUT);
+    digitalWrite(UART_RX_LED_PIN, LOW);
+  } else {
+    Serial.println("Warning: RX LED pin is not output-capable.");
+  }
+}
+
+void pulseLed(int pin, bool available, uint32_t &offAt) {
+  if (!available) return;
+  digitalWrite(pin, HIGH);
+  offAt = millis() + UART_LED_PULSE_MS;
+}
+
+void pulseTxLed() {
+  pulseLed(UART_TX_LED_PIN, txLedAvailable, txLedOffAt);
+}
+
+void pulseRxLed() {
+  pulseLed(UART_RX_LED_PIN, rxLedAvailable, rxLedOffAt);
+}
+
+void servicePulseLed(int pin, bool available, uint32_t &offAt) {
+  if (!available || offAt == 0) return;
+  if ((int32_t)(millis() - offAt) >= 0) {
+    digitalWrite(pin, LOW);
+    offAt = 0;
+  }
+}
+
+void serviceIndicators() {
+  servicePulseLed(UART_TX_LED_PIN, txLedAvailable, txLedOffAt);
+  servicePulseLed(UART_RX_LED_PIN, rxLedAvailable, rxLedOffAt);
+
+  if (!systemLedAvailable) return;
+  if (systemFaultActive()) {
+    digitalWrite(SYSTEM_LED_PIN, HIGH);
+    systemLedState = true;
+    return;
+  }
+
+  if (millis() - lastSystemBlinkMs >= SYSTEM_LED_BLINK_MS) {
+    lastSystemBlinkMs = millis();
+    systemLedState = !systemLedState;
+    digitalWrite(SYSTEM_LED_PIN, systemLedState ? HIGH : LOW);
+  }
 }
 
 bool validateSettings(const UartSettings &settings, String &error) {
@@ -1298,7 +1434,7 @@ bool sendUartBreakMs(uint32_t durationMs, String &error) {
       serialConfigValue(uartSettings.dataBits, uartSettings.parity, uartSettings.stopBits),
       uartSettings.rxPin,
       uartSettings.txPin);
-  digitalWrite(LED_BUILTIN, !digitalRead(LED_BUILTIN));
+  pulseTxLed();
   return true;
 }
 
@@ -1565,7 +1701,7 @@ void handleWsFrame(uint8_t clientIndex) {
       if (client.payloadPos > 0) {
         size_t written = BridgeSerial.write(client.payload, client.payloadPos);
         uartTxBytes += written;
-        digitalWrite(LED_BUILTIN, !digitalRead(LED_BUILTIN));
+        if (written > 0) pulseTxLed();
       }
       break;
     case 0x8:
@@ -1701,64 +1837,92 @@ void handleSerialToWeb() {
   if (len > 0 && (len == sizeof(buffer) || millis() - lastByteMs >= 5)) {
     uartRxBytes += len;
     broadcastBinary(buffer, len);
-    digitalWrite(LED_BUILTIN, !digitalRead(LED_BUILTIN));
+    pulseRxLed();
     len = 0;
   }
 }
 
 String apName() {
-  char name[24];
-  uint16_t suffix = (uint16_t)(ESP.getEfuseMac() & 0xFFFF);
-  snprintf(name, sizeof(name), "ESP32-UART-%04X", suffix);
-  return String(name);
+  return String(AP_SSID);
 }
 
 bool hasConfiguredWifi() {
-  return strlen(WIFI_SSID) > 0 && strcmp(WIFI_SSID, "YOUR_WIFI_SSID") != 0;
+  return strlen(STA_WIFI_SSID) > 0 && strcmp(STA_WIFI_SSID, "YOUR_WIFI_SSID") != 0;
+}
+
+void startAccessPoint() {
+  apMode = true;
+  activeSsid = apName();
+  WiFi.mode(WIFI_AP);
+  WiFi.softAP(activeSsid.c_str(), AP_PASSWORD);
+  Serial.print("AP SSID: ");
+  Serial.println(activeSsid);
+  Serial.print("AP IP: ");
+  Serial.println(WiFi.softAPIP());
 }
 
 void setupWifi() {
   WiFi.persistent(false);
   WiFi.setSleep(false);
 
-  if (hasConfiguredWifi()) {
+  pinMode(WIFI_MODE_SELECT_PIN, INPUT);
+  delay(10);
+  staModeRequested = digitalRead(WIFI_MODE_SELECT_PIN) == HIGH;
+
+  Serial.print("WiFi mode select GPIO");
+  Serial.print(WIFI_MODE_SELECT_PIN);
+  Serial.print(": ");
+  Serial.println(staModeRequested ? "HIGH, use STA" : "LOW, use AP");
+
+  if (staModeRequested && hasConfiguredWifi()) {
     Serial.print("Connecting to WiFi: ");
-    Serial.println(WIFI_SSID);
+    Serial.println(STA_WIFI_SSID);
     WiFi.mode(WIFI_STA);
-    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+    if (!WiFi.config(STA_STATIC_IP, STA_GATEWAY, STA_SUBNET, STA_DNS1, STA_DNS2)) {
+      Serial.println("Warning: static IP config failed.");
+    }
+    WiFi.begin(STA_WIFI_SSID, STA_WIFI_PASSWORD);
     uint32_t started = millis();
     while (WiFi.status() != WL_CONNECTED && millis() - started < 15000) {
+      serviceIndicators();
       delay(300);
       Serial.print(".");
     }
     Serial.println();
     if (WiFi.status() == WL_CONNECTED) {
       apMode = false;
-      activeSsid = WIFI_SSID;
+      activeSsid = STA_WIFI_SSID;
+      clearWifiFault();
       Serial.print("STA IP: ");
       Serial.println(WiFi.localIP());
+      Serial.print("Gateway: ");
+      Serial.println(WiFi.gatewayIP());
       return;
     }
+
+    setWifiFault("STA connect failed, fallback AP");
+    Serial.println("STA connect failed, fallback to AP.");
+  } else if (staModeRequested) {
+    setWifiFault("STA selected but WiFi credentials missing");
+    Serial.println("STA selected but WiFi credentials are missing.");
   }
 
-  apMode = true;
-  activeSsid = apName();
-  WiFi.mode(WIFI_AP);
-  WiFi.softAP(activeSsid.c_str(), AP_PASSWORD);
-  Serial.print("Fallback AP SSID: ");
-  Serial.println(activeSsid);
-  Serial.print("Fallback AP IP: ");
-  Serial.println(WiFi.softAPIP());
+  if (!staModeRequested) clearWifiFault();
+  startAccessPoint();
 }
 
 void maintainWifi() {
-  if (apMode || !hasConfiguredWifi()) return;
-  if (WiFi.status() == WL_CONNECTED) return;
+  if (apMode || !staModeRequested || !hasConfiguredWifi()) return;
+  if (WiFi.status() == WL_CONNECTED) {
+    clearWifiFault();
+    return;
+  }
+  if (!wifiFault) setWifiFault("STA disconnected");
   if (millis() - lastReconnectMs < 10000) return;
   lastReconnectMs = millis();
   Serial.println("WiFi disconnected, reconnecting...");
   WiFi.disconnect();
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  WiFi.begin(STA_WIFI_SSID, STA_WIFI_PASSWORD);
 }
 
 void handleRoot() {
@@ -1789,17 +1953,19 @@ void setupMdns() {
 }
 
 void setup() {
-  pinMode(LED_BUILTIN, OUTPUT);
-  digitalWrite(LED_BUILTIN, LOW);
   Serial.begin(115200);
   delay(300);
   Serial.println();
   Serial.println("ESP32 Wireless Web UART");
+  setupIndicatorPins();
 
   String error;
   if (!applyUartSettings(uartSettings, error)) {
+    setUartFault(error);
     Serial.print("UART setup error: ");
     Serial.println(error);
+  } else {
+    clearUartFault();
   }
 
   setupWifi();
@@ -1818,6 +1984,7 @@ void loop() {
   serviceWsClients();
   handleSerialToWeb();
   maintainWifi();
+  serviceIndicators();
 
   if (millis() - lastStatsMs >= 1000) {
     lastStatsMs = millis();

@@ -15,20 +15,33 @@
 - 不能把 RS232 的正负电压信号直接接到 ESP32。后续扩展 RS232 可加 `MAX3232`，扩展 RS485/RS422 可加差分收发器。
 - 淘宝常见 YD-ESP32 / ESP32-WROOM-32E 核心板一般可用 `GPIO16/GPIO17` 做 UART2。如果板卡引脚不同，可在网页里修改 RX/TX GPIO。
 
-## 配置 Wi-Fi
+## Wi-Fi 模式选择
 
-打开 [src/main.cpp](C:/Users/Lenovo/Documents/ESP32_UART/src/main.cpp)，修改文件顶部：
+固件启动时读取 `IO34`：
+
+- `IO34 = 1`：加入局域网 Wi-Fi，静态 IP 为 `192.168.0.201`，网关为 `192.168.0.1`。
+- `IO34 = 0`：开启 ESP32 热点，热点名称为 `ESP32-Tools`，密码为 `12345678`，默认地址为 `http://192.168.4.1/`。
+
+`IO34` 是输入专用脚，建议外部电阻明确上拉或下拉，避免悬空导致启动模式不稳定。
+
+真实局域网 Wi-Fi 密码放在本地文件 [src/wifi_config.h](C:/Users/Lenovo/Documents/ESP32_UART/src/wifi_config.h)，该文件已加入 `.gitignore`，不会提交到公开仓库。公开仓库里保留模板 [src/wifi_config.example.h](C:/Users/Lenovo/Documents/ESP32_UART/src/wifi_config.example.h)：
 
 ```cpp
-const char *WIFI_SSID = "YOUR_WIFI_SSID";
-const char *WIFI_PASSWORD = "YOUR_WIFI_PASSWORD";
+#define ESP32_TOOLS_STA_SSID "YOUR_WIFI_SSID"
+#define ESP32_TOOLS_STA_PASSWORD "YOUR_WIFI_PASSWORD"
 ```
 
-如果没有配置 Wi-Fi，或连接失败，ESP32 会自动开启热点：
+如果选择局域网模式但 Wi-Fi 连接失败，ESP32 会回退到 AP 热点，同时系统运行灯长亮表示异常。
 
-- SSID: `ESP32-UART-xxxx`
-- 密码: `12345678`
-- 默认地址: `http://192.168.4.1/`
+## 指示灯
+
+| GPIO | 功能 | 电平 |
+| --- | --- | --- |
+| IO32 | UART RX 指示 | 高有效，收到串口数据短亮 |
+| IO33 | 系统运行状态 | 正常 1Hz 闪烁，异常长亮 |
+| IO35 | 用户期望 UART TX 指示 | ESP32-WROOM-32 上是输入专用脚，不能输出点灯 |
+
+注意：ESP32-WROOM-32 的 `IO35` 不能作为输出脚。当前固件会检测到这个限制并关闭 TX LED 输出，只在串口日志里打印提示。如果需要 TX 指示灯，建议把 [src/main.cpp](C:/Users/Lenovo/Documents/ESP32_UART/src/main.cpp) 里的 `UART_TX_LED_PIN` 改到 `IO25/IO26/IO27` 等可输出 GPIO。
 
 ## 本地预览 Web 页面
 
@@ -86,7 +99,8 @@ http://<ESP32_IP>/
 - 多字符串条目支持 ASCII / HEX、独立发送间隔、浏览器本地保存
 - 多字符串条目支持 JSON 导入/导出
 - 支持 UART BREAK，BREAK 时间 `1..5000 ms`
-- STA 入网优先，失败自动 AP 热点
+- IO34 选择 STA/AP 模式；STA 使用静态 IP，失败自动 AP 热点
+- IO32 UART RX 指示灯，IO33 系统运行/异常指示灯
 - 不依赖第三方 Arduino 库
 
 ## 多字符串条目文件格式

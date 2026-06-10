@@ -279,6 +279,8 @@ h3{margin:0;font-size:14px;line-height:1.3;color:var(--ink);letter-spacing:0}
       <span class="chip"><span class="dot" id="connDot"></span><span id="connText">未连接</span></span>
       <span class="chip">IP <b id="ipText">--</b></span>
       <span class="chip">Wi-Fi <b id="wifiText">--</b></span>
+      <span class="chip">MODE <b id="modeText">--</b></span>
+      <span class="chip">FAULT <b id="faultText">none</b></span>
     </div>
   </header>
 
@@ -446,6 +448,8 @@ h3{margin:0;font-size:14px;line-height:1.3;color:var(--ink);letter-spacing:0}
       "ip=" + (mockMode ? "local-preview" : location.hostname),
       "wifi=" + (mockMode ? "Mock" : "--"),
       "ssid=" + (mockMode ? "Local Preview" : "--"),
+      "select=" + (mockMode ? "PREVIEW" : "--"),
+      "fault=none",
       "clients=1"
     ].join("|");
   }
@@ -514,6 +518,8 @@ h3{margin:0;font-size:14px;line-height:1.3;color:var(--ink);letter-spacing:0}
       $("txPin").value = data.tx || $("txPin").value;
       $("ipText").textContent = data.ip || location.hostname;
       $("wifiText").textContent = data.wifi || "--";
+      $("modeText").textContent = data.select || "--";
+      $("faultText").textContent = data.fault || "none";
       $("clients").textContent = data.clients || "1";
       $("serialText").textContent = `${$("baud").value} ${$("dataBits").value}${$("parity").value}${$("stopBits").value}`;
       setConn("ok", "已连接");
